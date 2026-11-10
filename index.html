@@ -60,14 +60,16 @@
 </div>
 
 <script type="module">
-import { FFmpeg } from './lib/ffmpeg/index.js';
-import { fetchFile } from './lib/util/index.js';
+import { FFmpeg } from 'https://unpkg.com/@ffmpeg/ffmpeg@0.12.10/dist/esm/index.js';
+import { fetchFile, toBlobURL } from 'https://unpkg.com/@ffmpeg/util@0.12.1/dist/esm/index.js';
 
 const tg = window.Telegram?.WebApp;
 tg?.ready(); tg?.expand();
 
 const MB = 1024 * 1024;
 const HEIGHTS = [1080, 720, 480, 360];
+const FF_BASE = 'https://unpkg.com/@ffmpeg/ffmpeg@0.12.10/dist/esm';
+const CORE_BASE = 'https://unpkg.com/@ffmpeg/core@0.12.6/dist/esm';
 const $ = id => document.getElementById(id);
 const esc = s => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const fmtDur = s => { s = Math.round(s); return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`; };
@@ -82,6 +84,14 @@ let ffPromise = null, running = false, stopFlag = false, stopReject = null;
 let current = null, finished = 0, total = 0, wakeLock = null;
 
 // ---------- ffmpeg ----------
+// Воркер библиотеки нельзя запустить с чужого домена (unpkg), поэтому берём его исходник
+// и создаём blob-URL, в котором импорты указывают на unpkg (модули с CORS разрешены).
+async function makeWorkerURL() {
+  const src = await (await fetch(`${FF_BASE}/worker.js`)).text();
+  const fixed = src.replace(/from\s*"\.\/(const|errors)\.js"/g, (_, n) => `from "${FF_BASE}/${n}.js"`);
+  return URL.createObjectURL(new Blob([fixed], { type: 'text/javascript' }));
+}
+
 function getFFmpeg() {
   if (!ffPromise) {
     ffPromise = (async () => {
@@ -93,8 +103,9 @@ function getFFmpeg() {
         }
       });
       await f.load({
-        coreURL: './lib/core/ffmpeg-core.js',
-        wasmURL: './lib/core/ffmpeg-core.wasm',
+        classWorkerURL: await makeWorkerURL(),
+        coreURL: await toBlobURL(`${CORE_BASE}/ffmpeg-core.js`, 'text/javascript'),
+        wasmURL: await toBlobURL(`${CORE_BASE}/ffmpeg-core.wasm`, 'application/wasm'),
       });
       return f;
     })();
@@ -108,6 +119,7 @@ function readMeta(file) {
   return new Promise((resolve, reject) => {
     const v = document.createElement('video');
     v.preload = 'metadata';
+    v.muted = true;
     const url = URL.createObjectURL(file);
     v.onloadedmetadata = () => {
       resolve({ duration: v.duration, w: v.videoWidth, h: v.videoHeight });
@@ -167,7 +179,7 @@ async function encode(it) {
     if (code !== 0) throw new Error(`ffmpeg завершился с кодом ${code}`);
   });
 
-  // Вход: WORKERFS читает файл с диска без копирования в память; если не получилось, копируем
+  // Вход: сначала пробуем WORKERFS (без копирования в память), иначе копируем файл в память
   const ext = (it.file.name.match(/\.[^.]+$/) || ['.mp4'])[0].toLowerCase();
   let inPath, mounted = false;
   await f.createDir('/in').catch(() => {});
@@ -244,7 +256,7 @@ async function startQueue() {
       it.msg = `${fmtMB(blob.size)} (цель ${fmtMB(it.target)})`;
       log(`  готово: ${it.outName}, ${fmtMB(blob.size)}`);
     } catch (e) {
-      if (e instanceof Cancelled) { it.status = 'готов'; it.msg = ''; break; }
+      if (e instanceof Cancelled || stopFlag) { it.status = 'готов'; it.msg = ''; break; }
       it.status = 'ошибка'; it.msg = e.message;
       log(`  ошибка: ${it.file.name}: ${e.message}`);
     }
@@ -271,7 +283,7 @@ async function stopQueue() {
   stopReject?.(new Cancelled());
   if (ffPromise) {
     try { (await ffPromise).terminate(); } catch {}
-    ffPromise = null; // при следующем запуске ffmpeg загрузится заново (из кеша браузера)
+    ffPromise = null; // при следующем запуске ffmpeg загрузится заново
   }
 }
 
