@@ -1,1 +1,406 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Сжатие видео</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+  :root{
+    --bg:var(--tg-theme-bg-color,#fff); --fg:var(--tg-theme-text-color,#111);
+    --hint:var(--tg-theme-hint-color,#777); --btn:var(--tg-theme-button-color,#2563eb);
+    --btnfg:var(--tg-theme-button-text-color,#fff); --sec:var(--tg-theme-secondary-bg-color,#f1f2f4);
+  }
+  body{margin:0;padding:12px;font-family:system-ui,sans-serif;background:var(--bg);color:var(--fg);font-size:15px}
+  h2{margin:4px 0 12px;font-size:20px}
+  .card{background:var(--sec);border-radius:12px;padding:12px;margin-bottom:12px}
+  .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+  input[type=number]{width:90px;padding:8px;font-size:15px;border-radius:8px;border:1px solid #ccc}
+  button,.btn{padding:10px 14px;border:0;border-radius:8px;background:var(--btn);color:var(--btnfg);
+    font-size:15px;text-decoration:none;display:inline-block;cursor:pointer}
+  button.sec{background:#8a8f98}
+  button:disabled{opacity:.4}
+  .drop{border:2px dashed var(--hint);border-radius:12px;padding:22px;text-align:center;color:var(--hint);cursor:pointer}
+  .item{background:var(--bg);border-radius:10px;padding:10px;margin-top:8px}
+  .item b{word-break:break-all}
+  .muted{color:var(--hint);font-size:13px}
+  .ok{color:#15803d}.err{color:#b91c1c}
+  select{width:100%;padding:8px;margin:6px 0;font-size:14px;border-radius:8px}
+  .bar{height:8px;background:#ddd;border-radius:4px;overflow:hidden;margin:6px 0}
+  .bar>div{height:100%;background:var(--btn);width:0;transition:width .3s}
+  #log{font-size:12px;white-space:pre-wrap;max-height:160px;overflow:auto;color:var(--hint)}
+  .act{display:flex;gap:6px;flex-wrap:wrap;margin-top:6px}
+</style>
+</head>
+<body>
+<h2>Сжатие видео</h2>
 
+<div class="card">
+  <div class="drop" id="drop">Нажмите, чтобы выбрать видео (можно несколько)</div>
+  <input type="file" id="fileInput" accept="video/*" multiple hidden>
+</div>
+
+<div class="card row">
+  <label>Целевой размер, МБ&nbsp;<input id="targetMB" type="number" value="25" min="0.1" step="0.1"></label>
+  <button id="recalc" class="sec">Пересчитать</button>
+  <button id="clearBtn" class="sec">Очистить список</button>
+</div>
+
+<div id="list"></div>
+
+<div class="card">
+  <div class="row">
+    <button id="startBtn" disabled>▶ Сжать всё</button>
+    <button id="stopBtn" class="sec" disabled>■ Стоп</button>
+  </div>
+  <div class="muted" id="status">Добавьте видео</div>
+  <div class="bar"><div id="overall"></div></div>
+  <div class="bar"><div id="current"></div></div>
+  <div id="log"></div>
+</div>
+
+<script type="module">
+import { FFmpeg } from './lib/ffmpeg/index.js';
+import { fetchFile } from './lib/util/index.js';
+
+const tg = window.Telegram?.WebApp;
+tg?.ready(); tg?.expand();
+
+const MB = 1024 * 1024;
+const HEIGHTS = [1080, 720, 480, 360];
+const $ = id => document.getElementById(id);
+const esc = s => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const fmtDur = s => { s = Math.round(s); return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`; };
+const fmtMB = b => (b / MB).toFixed(2) + ' МБ';
+const log = t => { const d = $('log'); d.textContent += t + '\n'; d.scrollTop = d.scrollHeight; };
+const status = t => { $('status').textContent = t; };
+class Cancelled extends Error {}
+
+const items = [];
+let nextId = 1;
+let ffPromise = null, running = false, stopFlag = false, stopReject = null;
+let current = null, finished = 0, total = 0, wakeLock = null;
+
+// ---------- ffmpeg ----------
+function getFFmpeg() {
+  if (!ffPromise) {
+    ffPromise = (async () => {
+      const f = new FFmpeg();
+      f.on('progress', ({ progress }) => {
+        if (current && Number.isFinite(progress)) {
+          current.frac = (current.pass - 1 + Math.min(1, Math.max(0, progress))) / 2;
+          bars();
+        }
+      });
+      await f.load({
+        coreURL: './lib/core/ffmpeg-core.js',
+        wasmURL: './lib/core/ffmpeg-core.wasm',
+      });
+      return f;
+    })();
+    ffPromise.catch(() => { ffPromise = null; });
+  }
+  return ffPromise;
+}
+
+// ---------- метаданные и расчёт ----------
+function readMeta(file) {
+  return new Promise((resolve, reject) => {
+    const v = document.createElement('video');
+    v.preload = 'metadata';
+    const url = URL.createObjectURL(file);
+    v.onloadedmetadata = () => {
+      resolve({ duration: v.duration, w: v.videoWidth, h: v.videoHeight });
+      URL.revokeObjectURL(url);
+    };
+    v.onerror = () => { URL.revokeObjectURL(url); reject(new Error('браузер не открывает файл (попробуйте MP4 или MOV с H.264)')); };
+    v.src = url;
+  });
+}
+
+function makePlan(meta, target) {
+  const totalKbps = target * 8 / meta.duration / 1000;
+  const aKbps = totalKbps < 250 ? 48 : totalKbps < 600 ? 64 : 96;
+  const vKbps = Math.floor(totalKbps * 0.93 - aKbps); // запас 7% на контейнер
+  if (vKbps < 20) return { options: [], text: `цель слишком мала (~${Math.round(totalKbps)} kbps)` };
+
+  const options = [];
+  for (const h of [meta.h, ...HEIGHTS.filter(x => x < meta.h)]) {
+    const w = Math.round(meta.w * h / meta.h / 2) * 2;
+    for (const fps of [30, 24, 15]) {
+      const bpp = vKbps * 1000 / (w * h * fps);
+      const q = bpp >= 0.10 ? 'высокое' : bpp >= 0.06 ? 'хорошее' : bpp >= 0.035 ? 'среднее' : 'низкое';
+      if (q !== 'низкое') options.push({ w, h, fps, q, vKbps, aKbps });
+    }
+  }
+  if (!options.length) return { options: [], text: 'качество будет низким даже при минимальном разрешении' };
+  const rec = Math.max(0, options.findIndex(o => o.q === 'высокое' || o.q === 'хорошее'));
+  return { options, rec };
+}
+
+function targetBytes() {
+  const v = parseFloat(String($('targetMB').value).replace(',', '.'));
+  return v > 0 ? v * MB : null;
+}
+
+function plan(it) {
+  const target = targetBytes();
+  if (!target) { it.status = 'ошибка'; it.msg = 'укажите целевой размер больше нуля'; return; }
+  it.target = target;
+  it.options = []; it.rec = 0; it.sel = 0; it.msg = '';
+  if (!it.meta) return;
+  if (it.file.size <= target) { it.status = 'пропуск'; it.msg = 'уже меньше цели'; return; }
+  const p = makePlan(it.meta, target);
+  if (!p.options.length) { it.status = 'пропуск'; it.msg = p.text; return; }
+  Object.assign(it, { options: p.options, rec: p.rec, sel: p.rec, status: 'готов' });
+}
+
+// ---------- кодирование ----------
+async function encode(it) {
+  const f = await getFFmpeg();
+  const opt = it.options[it.sel];
+
+  // Отмена: гонка с промисом, который отклоняется по кнопке «Стоп»
+  const cancelP = new Promise((_, rej) => { stopReject = rej; });
+  cancelP.catch(() => {});
+  const exec = args => Promise.race([f.exec(args), cancelP]).then(code => {
+    if (code !== 0) throw new Error(`ffmpeg завершился с кодом ${code}`);
+  });
+
+  // Вход: WORKERFS читает файл с диска без копирования в память; если не получилось, копируем
+  const ext = (it.file.name.match(/\.[^.]+$/) || ['.mp4'])[0].toLowerCase();
+  let inPath, mounted = false;
+  await f.createDir('/in').catch(() => {});
+  try {
+    await f.mount('WORKERFS', { files: [it.file] }, '/in');
+    mounted = true;
+    inPath = `/in/${it.file.name}`;
+  } catch {
+    inPath = `input${ext}`;
+    await f.writeFile(inPath, await fetchFile(it.file));
+  }
+
+  const outPath = 'output.mp4';
+  let vk = opt.vKbps;
+  try {
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      it.attempt = attempt;
+      const common = ['-i', inPath, '-vf', `scale=${opt.w}:${opt.h},fps=${opt.fps}`,
+        '-c:v', 'libx264', '-b:v', `${vk}k`, '-passlogfile', 'pass'];
+
+      it.pass = 1; it.frac = 0; render();
+      await exec([...common, '-pass', '1', '-preset', 'veryfast', '-an', '-f', 'null', '-']);
+
+      it.pass = 2; it.frac = 0.5; render();
+      await exec([...common, '-pass', '2', '-preset', 'veryfast', '-pix_fmt', 'yuv420p',
+        '-c:a', 'aac', '-b:a', `${opt.aKbps}k`, '-movflags', '+faststart', '-y', outPath]);
+
+      const data = await f.readFile(outPath);
+      await f.deleteFile(outPath).catch(() => {});
+      const size = data.byteLength;
+      if (size <= it.target * 1.03 || attempt === 3) return new Blob([data], { type: 'video/mp4' });
+      vk = Math.max(10, Math.floor(vk * it.target / size * 0.95));
+    }
+  } finally {
+    stopReject = null;
+    // при остановке воркер уже убит, очистку пропускаем, чтобы не зависнуть
+    if (!stopFlag) {
+      if (mounted) await f.unmount('/in').catch(() => {});
+      else await f.deleteFile(inPath).catch(() => {});
+    }
+  }
+}
+
+// ---------- очередь ----------
+async function startQueue() {
+  const ready = items.filter(it => it.status === 'готов');
+  if (!ready.length) return alert('Нет файлов со статусом «готов»');
+
+  running = true; stopFlag = false; total = ready.length; finished = 0; current = null;
+  setButtons(); render(); bars(); keepAwake(true);
+  log(`--- старт: ${total} файл(ов) ---`);
+
+  try {
+    status('Загрузка движка ffmpeg…');
+    await getFFmpeg();
+  } catch (e) {
+    log('Не удалось загрузить ffmpeg: ' + e.message);
+    return finish();
+  }
+
+  for (const it of ready) {
+    if (stopFlag) break;
+    it.status = 'кодирование'; it.frac = 0; it.pass = 1; it.attempt = 1; it.msg = '';
+    current = it;
+    render(); bars();
+    status(`Сжатие: ${it.file.name}`);
+    log(`Сжатие: ${it.file.name} → ${it.options[it.sel].h}p, ${it.options[it.sel].fps} fps`);
+    try {
+      const blob = await encode(it);
+      it.outName = it.file.name.replace(/\.[^.]+$/, '') + '_compressed.mp4';
+      it.outFile = new File([blob], it.outName, { type: 'video/mp4' });
+      it.url = URL.createObjectURL(blob);
+      it.status = 'готово';
+      it.msg = `${fmtMB(blob.size)} (цель ${fmtMB(it.target)})`;
+      log(`  готово: ${it.outName}, ${fmtMB(blob.size)}`);
+    } catch (e) {
+      if (e instanceof Cancelled) { it.status = 'готов'; it.msg = ''; break; }
+      it.status = 'ошибка'; it.msg = e.message;
+      log(`  ошибка: ${it.file.name}: ${e.message}`);
+    }
+    current = null;
+    finished++;
+    bars(); render();
+  }
+  finish();
+}
+
+function finish() {
+  running = false; current = null;
+  keepAwake(false);
+  items.forEach(it => { if (it.status === 'кодирование') it.status = 'готов'; });
+  status(stopFlag ? 'Остановлено' : `Готово: ${finished} из ${total}`);
+  if (stopFlag) log('--- остановлено пользователем ---');
+  else log('--- очередь завершена ---');
+  setButtons(); render(); bars();
+}
+
+async function stopQueue() {
+  stopFlag = true;
+  status('Остановка…');
+  stopReject?.(new Cancelled());
+  if (ffPromise) {
+    try { (await ffPromise).terminate(); } catch {}
+    ffPromise = null; // при следующем запуске ffmpeg загрузится заново (из кеша браузера)
+  }
+}
+
+// ---------- интерфейс ----------
+function bars() {
+  const done = total ? (finished + (current?.frac || 0)) / total * 100 : 0;
+  $('overall').style.width = done + '%';
+  $('current').style.width = ((current?.frac || 0) * 100) + '%';
+}
+
+function setButtons() {
+  $('startBtn').disabled = running || !items.some(it => it.status === 'готов');
+  $('stopBtn').disabled = !running;
+  $('recalc').disabled = running;
+  $('clearBtn').disabled = running;
+}
+
+function canShare(it) {
+  return !!(it.outFile && navigator.canShare && navigator.canShare({ files: [it.outFile] }));
+}
+
+function cardHTML(it) {
+  const m = it.meta;
+  const info = m ? `${m.w}×${m.h}, ${fmtDur(m.duration)}` : 'читаю файл…';
+  let body = '';
+  if (it.options.length && it.status === 'готов') {
+    body = `<select data-id="${it.id}" ${running ? 'disabled' : ''}>${it.options.map((o, i) =>
+      `<option value="${i}"${i === it.sel ? ' selected' : ''}>${o.h}p · ${o.fps} fps · ${o.q}${i === it.rec ? ' ★ рекомендуется' : ''}</option>`
+    ).join('')}</select>`;
+  } else if (it.options.length) {
+    const o = it.options[it.sel];
+    body = `<div class="muted">${o.h}p · ${o.fps} fps · ${o.q}</div>`;
+  }
+
+  let st = '';
+  if (it.status === 'кодирование') {
+    st = `<div class="muted">проход ${it.pass}/2, попытка ${it.attempt}</div>`;
+  } else if (it.status === 'готово') {
+    st = `<div class="ok">Готово: ${esc(it.msg)}</div>
+      <div class="act">
+        <a class="btn" href="${it.url}" download="${esc(it.outName)}">Скачать</a>
+        ${canShare(it) ? `<button class="sec" data-share="${it.id}">Поделиться</button>` : ''}
+      </div>`;
+  } else if (it.status === 'ошибка') {
+    st = `<div class="err">Ошибка: ${esc(it.msg)}</div>`;
+  } else if (it.msg) {
+    st = `<div class="muted">${esc(it.msg)}</div>`;
+  }
+
+  return `<div class="item">
+    <b>${esc(it.file.name)}</b>
+    <div class="muted">${fmtMB(it.file.size)} · ${info} · ${esc(it.status)}</div>
+    ${body}${st}
+  </div>`;
+}
+
+function render() {
+  $('list').innerHTML = items.map(cardHTML).join('');
+  setButtons();
+}
+
+async function addFiles(list) {
+  for (const file of list) {
+    if (!file.type.startsWith('video/') && !/\.(mp4|mov|mkv|avi|webm|m4v|ts)$/i.test(file.name)) continue;
+    const it = { id: nextId++, file, meta: null, options: [], rec: 0, sel: 0, status: 'анализ',
+      msg: '', target: 0, frac: 0, pass: 1, attempt: 1, url: null, outFile: null, outName: '' };
+    items.push(it);
+    render();
+    try {
+      it.meta = await readMeta(file);
+      if (!it.meta.w) throw new Error('нет видеодорожки');
+      if (!it.meta.duration || !isFinite(it.meta.duration)) throw new Error('не удалось определить длительность');
+      plan(it);
+    } catch (e) {
+      it.status = 'ошибка'; it.msg = e.message;
+    }
+    render();
+  }
+}
+
+function recalcAll() {
+  if (running) return;
+  if (!targetBytes()) return alert('Укажите целевой размер больше нуля, например 25');
+  items.forEach(it => { if (it.meta && it.status !== 'готово') plan(it); });
+  render();
+}
+
+function clearAll() {
+  if (running) return;
+  items.forEach(it => { if (it.url) URL.revokeObjectURL(it.url); });
+  items.length = 0;
+  render();
+  status('Добавьте видео');
+}
+
+async function keepAwake(on) {
+  try {
+    if (on) wakeLock = await navigator.wakeLock?.request('screen');
+    else { await wakeLock?.release(); wakeLock = null; }
+  } catch {}
+}
+
+// ---------- события ----------
+const drop = $('drop'), fi = $('fileInput');
+drop.onclick = () => fi.click();
+fi.onchange = () => { const files = [...fi.files]; fi.value = ''; addFiles(files); };
+
+$('list').addEventListener('change', e => {
+  const sel = e.target.closest('select[data-id]');
+  if (!sel) return;
+  const it = items.find(x => x.id === +sel.dataset.id);
+  it.sel = +sel.value;
+  render();
+});
+
+$('list').addEventListener('click', async e => {
+  const b = e.target.closest('button[data-share]');
+  if (!b) return;
+  const it = items.find(x => x.id === +b.dataset.share);
+  try { await navigator.share({ files: [it.outFile], title: it.outName }); } catch {}
+});
+
+$('recalc').onclick = recalcAll;
+$('clearBtn').onclick = clearAll;
+$('startBtn').onclick = startQueue;
+$('stopBtn').onclick = stopQueue;
+addEventListener('beforeunload', e => { if (running) e.preventDefault(); });
+
+setButtons();
+</script>
+</body>
+</html>
